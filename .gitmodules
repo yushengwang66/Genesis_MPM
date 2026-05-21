@@ -1,0 +1,3 @@
+[submodule "Genesis_MPM"]
+	path = Genesis_MPM
+	url = https://github.com/Genesis-Embodied-AI/genesis-world.git
