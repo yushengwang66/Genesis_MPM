@@ -7,17 +7,35 @@ from .mpm_solver import MPMSolver as _BaseMPMSolver
 
 @qd.data_oriented
 class MPMSolver(_BaseMPMSolver):
-    """MPM solver extension with optional SPH-style numerical surface tension.
+    """MPM solver extension with optional SPH-style cohesion/surface tension controls.
 
-    Surface tension is enabled only when at least one MPM material has gamma > 0.
+    Surface tension/cohesion is enabled only when at least one MPM material has gamma > 0.
     With gamma=0, this class follows the original MPMSolver path.
+
+    This extension adds three SPH-like stabilizers for ferrofluid-droplet style simulations:
+    1. particle-particle short-range cohesion before p2g,
+    2. more isotropic 26-neighbor color/curvature stencil on the MPM grid,
+    3. near-ground horizontal damping to reduce contact-line spreading.
     """
 
     def __init__(self, scene, sim, options):
         super().__init__(scene, sim, options)
         self._has_surface_tension = False
         self._material_gammas = []
+
+        # Safety clamps for the added numerical forces.
         self._surface_tension_max_acc = 500.0
+        self._particle_cohesion_max_acc = 500.0
+
+        # Particle-particle cohesion support radius. A radius of ~2.5 particle spacings usually captures enough
+        # neighbors for a compact droplet while keeping the O(N^2) fallback acceptable for small ferrofluid robots.
+        self._particle_cohesion_radius_factor = 2.5
+
+        # Contact-line damping near a flat ground plane at z=0. This is intentionally conservative: it damps horizontal
+        # momentum only in a thin band close to the ground, reducing spreading without pinning the whole droplet.
+        self._ground_z = 0.0
+        self._ground_damping_height_factor = 3.0
+        self._ground_horizontal_damping = 0.65
 
     def add_material(self, material):
         super().add_material(material)
@@ -40,13 +58,37 @@ class MPMSolver(_BaseMPMSolver):
             self.surface_curvature = qd.field(dtype=gs.qd_float, shape=shape)
 
     def substep_pre_coupling(self, f):
-        super().substep_pre_coupling(f)
+        # Inline the base MPM pre-coupling flow so particle-level cohesion can be applied before p2g uses particle vel.
+        if self._sim.requires_grad:
+            self.reset_grid_and_grad(f)
+            self.compute_F_tmp(f)
+            self.svd(f)
+        else:
+            if self.needs_svd:
+                self.compute_F_tmp_and_svd(f)
+            else:
+                self.compute_F_tmp_only(f)
+
+        if self._has_surface_tension and not self._sim.requires_grad:
+            self.apply_particle_cohesion(f)
+
+        self.p2g(
+            f,
+            self.sim.coupler.rigid_solver.geoms_state,
+            self.sim.coupler.rigid_solver.geoms_info,
+            self.sim.coupler.rigid_solver.links_state,
+            self.sim.coupler.rigid_solver._rigid_global_info,
+            self.sim.coupler.rigid_solver.collider._sdf._sdf_info,
+            self.sim.coupler.rigid_solver.collider._collider_static_config,
+        )
+
         if self._has_surface_tension and not self._sim.requires_grad:
             self.reset_surface_fields(f)
             self.project_surface_color(f)
             self.compute_surface_normal(f)
             self.compute_surface_curvature(f)
             self.apply_surface_tension_to_grid(f)
+            self.apply_ground_horizontal_damping(f)
 
     @qd.kernel
     def reset_surface_fields(self, f: qd.i32):
@@ -58,14 +100,49 @@ class MPMSolver(_BaseMPMSolver):
             self.surface_normal[f, i, j, k, i_b] = qd.Vector.zero(gs.qd_float, 3)
             self.surface_curvature[f, i, j, k, i_b] = gs.qd_float(0.0)
 
+    @qd.func
+    def _func_particle_gamma(self, i_p):
+        gamma = gs.qd_float(0.0)
+        for mat_idx in qd.static(self._materials_idx):
+            if self.particles_info[i_p].material_idx == mat_idx:
+                gamma = gs.qd_float(self._material_gammas[mat_idx])
+        return gamma
+
+    @qd.kernel
+    def apply_particle_cohesion(self, f: qd.i32):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles_ng[f, i_p, i_b].active:
+                gamma_i = self._func_particle_gamma(i_p)
+                if gamma_i > gs.qd_float(0.0):
+                    xi = self.particles[f, i_p, i_b].pos
+                    acc = qd.Vector.zero(gs.qd_float, 3)
+                    support_radius = gs.qd_float(self._particle_cohesion_radius_factor * self._particle_size)
+
+                    for j_p in range(self._n_particles):
+                        if j_p != i_p and self.particles_ng[f, j_p, i_b].active:
+                            xj = self.particles[f, j_p, i_b].pos
+                            d_ij = xi - xj
+                            dist = d_ij.norm(gs.EPS)
+
+                            if dist > gs.qd_float(1e-6) and dist < support_radius:
+                                q = dist / support_radius
+                                # Smooth compact kernel: strong at close range, zero at support radius.
+                                w = (gs.qd_float(1.0) - q) * (gs.qd_float(1.0) - q)
+                                direction_to_neighbor = -d_ij / dist
+                                acc += gamma_i * w * direction_to_neighbor
+
+                    acc_norm = acc.norm(gs.EPS)
+                    max_acc = gs.qd_float(self._particle_cohesion_max_acc)
+                    if acc_norm > max_acc:
+                        acc = acc / acc_norm * max_acc
+
+                    self.particles[f, i_p, i_b].vel += self.substep_dt * acc
+
     @qd.kernel
     def project_surface_color(self, f: qd.i32):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             if self.particles_ng[f, i_p, i_b].active:
-                gamma = gs.qd_float(0.0)
-                for mat_idx in qd.static(self._materials_idx):
-                    if self.particles_info[i_p].material_idx == mat_idx:
-                        gamma = gs.qd_float(self._material_gammas[mat_idx])
+                gamma = self._func_particle_gamma(i_p)
 
                 if gamma > gs.qd_float(0.0):
                     base = qd.floor(self.particles[f, i_p, i_b].pos * self._inv_dx - 0.5).cast(gs.qd_int)
@@ -92,20 +169,26 @@ class MPMSolver(_BaseMPMSolver):
                 and jj < self._grid_res[1] - 1
                 and kk < self._grid_res[2] - 1
             ):
-                grad_c = qd.Vector(
-                    [
-                        (self.surface_color[f, ii + 1, jj, kk, i_b] - self.surface_color[f, ii - 1, jj, kk, i_b])
-                        * 0.5
-                        * self._inv_dx,
-                        (self.surface_color[f, ii, jj + 1, kk, i_b] - self.surface_color[f, ii, jj - 1, kk, i_b])
-                        * 0.5
-                        * self._inv_dx,
-                        (self.surface_color[f, ii, jj, kk + 1, i_b] - self.surface_color[f, ii, jj, kk - 1, i_b])
-                        * 0.5
-                        * self._inv_dx,
-                    ],
-                    dt=gs.qd_float,
-                )
+                grad_c = qd.Vector.zero(gs.qd_float, 3)
+                weight_sum = gs.qd_float(0.0)
+
+                # 26-neighbor isotropic gradient stencil. Compared with the old 6-neighbor central difference, this
+                # reduces axis-aligned square artifacts by including face, edge and corner directions.
+                for offset_raw in qd.static(qd.grouped(qd.ndrange(3, 3, 3))):
+                    sx = offset_raw[0] - 1
+                    sy = offset_raw[1] - 1
+                    sz = offset_raw[2] - 1
+                    if sx != 0 or sy != 0 or sz != 0:
+                        direction = qd.Vector([sx, sy, sz], dt=gs.qd_float)
+                        dist2 = direction.dot(direction)
+                        weight = gs.qd_float(1.0) / dist2
+                        c_nb = self.surface_color[f, ii + sx, jj + sy, kk + sz, i_b]
+                        grad_c += c_nb * direction * weight
+                        weight_sum += weight
+
+                if weight_sum > gs.qd_float(0.0):
+                    grad_c = grad_c * self._inv_dx / weight_sum
+
                 norm = grad_c.norm(gs.EPS)
                 self.surface_grad_c[f, ii, jj, kk, i_b] = grad_c
                 if norm > gs.qd_float(1e-6):
@@ -122,14 +205,27 @@ class MPMSolver(_BaseMPMSolver):
                 and jj < self._grid_res[1] - 1
                 and kk < self._grid_res[2] - 1
             ):
-                div_n = (
-                    self.surface_normal[f, ii + 1, jj, kk, i_b][0]
-                    - self.surface_normal[f, ii - 1, jj, kk, i_b][0]
-                    + self.surface_normal[f, ii, jj + 1, kk, i_b][1]
-                    - self.surface_normal[f, ii, jj - 1, kk, i_b][1]
-                    + self.surface_normal[f, ii, jj, kk + 1, i_b][2]
-                    - self.surface_normal[f, ii, jj, kk - 1, i_b][2]
-                ) * 0.5 * self._inv_dx
+                n_center = self.surface_normal[f, ii, jj, kk, i_b]
+                div_n = gs.qd_float(0.0)
+                weight_sum = gs.qd_float(0.0)
+
+                # 26-neighbor divergence of normal. This is not a full geometric curvature estimator, but it is more
+                # isotropic than the old axis-only stencil and works as a compact numerical cohesion control.
+                for offset_raw in qd.static(qd.grouped(qd.ndrange(3, 3, 3))):
+                    sx = offset_raw[0] - 1
+                    sy = offset_raw[1] - 1
+                    sz = offset_raw[2] - 1
+                    if sx != 0 or sy != 0 or sz != 0:
+                        direction = qd.Vector([sx, sy, sz], dt=gs.qd_float)
+                        dist2 = direction.dot(direction)
+                        weight = gs.qd_float(1.0) / dist2
+                        n_nb = self.surface_normal[f, ii + sx, jj + sy, kk + sz, i_b]
+                        div_n += (n_nb - n_center).dot(direction) * weight
+                        weight_sum += weight
+
+                if weight_sum > gs.qd_float(0.0):
+                    div_n = div_n * self._inv_dx / weight_sum
+
                 self.surface_curvature[f, ii, jj, kk, i_b] = -div_n
 
     @qd.kernel
@@ -155,3 +251,15 @@ class MPMSolver(_BaseMPMSolver):
                         a_st = a_st / a_norm * max_a
 
                     self.grid[f, I, i_b].vel_in += self.grid[f, I, i_b].mass * self.substep_dt * a_st
+
+    @qd.kernel
+    def apply_ground_horizontal_damping(self, f: qd.i32):
+        for ii, jj, kk, i_b in qd.ndrange(*self._grid_res, self._B):
+            I = (ii, jj, kk)
+            if self.grid[f, I, i_b].mass > gs.EPS:
+                z = (kk + self._grid_offset[2]) * self._dx
+                ground_band = gs.qd_float(self._ground_damping_height_factor * self._particle_size)
+                if z > gs.qd_float(self._ground_z) and z < gs.qd_float(self._ground_z) + ground_band:
+                    damping = gs.qd_float(self._ground_horizontal_damping)
+                    self.grid[f, I, i_b].vel_in[0] *= damping
+                    self.grid[f, I, i_b].vel_in[1] *= damping
