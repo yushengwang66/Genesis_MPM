@@ -7,7 +7,7 @@ from .mpm_solver import MPMSolver as _BaseMPMSolver
 
 @qd.data_oriented
 class MPMSolver(_BaseMPMSolver):
-    """MPM solver extension with optional grid-based CSF surface tension.
+    """MPM solver extension with optional SPH-style numerical surface tension.
 
     Surface tension is enabled only when at least one MPM material has gamma > 0.
     With gamma=0, this class follows the original MPMSolver path.
@@ -17,7 +17,7 @@ class MPMSolver(_BaseMPMSolver):
         super().__init__(scene, sim, options)
         self._has_surface_tension = False
         self._material_gammas = []
-        self._surface_tension_max_acc = 50.0
+        self._surface_tension_max_acc = 500.0
 
     def add_material(self, material):
         super().add_material(material)
@@ -138,12 +138,20 @@ class MPMSolver(_BaseMPMSolver):
             I = (ii, jj, kk)
             if self.grid[f, I, i_b].mass > gs.EPS and self.surface_gamma_den[f, I, i_b] > gs.EPS:
                 gamma = self.surface_gamma_num[f, I, i_b] / self.surface_gamma_den[f, I, i_b]
-                mass_real = self.grid[f, I, i_b].mass / self._particle_volume_scale
-                rho_grid = mass_real * self._inv_dx * self._inv_dx * self._inv_dx
-                if rho_grid > gs.EPS:
-                    a_st = gamma * self.surface_curvature[f, I, i_b] * self.surface_grad_c[f, I, i_b] / rho_grid
+                grad_c = self.surface_grad_c[f, I, i_b]
+                grad_norm = grad_c.norm(gs.EPS)
+
+                if gamma > gs.qd_float(0.0) and grad_norm > gs.qd_float(1e-6):
+                    normal = grad_c / grad_norm
+                    curvature = self.surface_curvature[f, I, i_b]
+
+                    # SPH-like numerical surface tension / cohesion. Here gamma is an acceleration-scale control,
+                    # not a physical N/m coefficient. This makes MPM.Liquid(gamma=...) behave closer to SPH.Liquid.
+                    a_st = gamma * curvature * normal
+
                     a_norm = a_st.norm(gs.EPS)
                     max_a = gs.qd_float(self._surface_tension_max_acc)
                     if a_norm > max_a:
                         a_st = a_st / a_norm * max_a
+
                     self.grid[f, I, i_b].vel_in += self.grid[f, I, i_b].mass * self.substep_dt * a_st
