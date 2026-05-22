@@ -4,6 +4,7 @@ import quadrants as qd
 from pydantic import StrictBool
 
 import genesis as gs
+from genesis.typing import NonNegativeFloat
 
 from .base import Base
 
@@ -23,9 +24,12 @@ class Liquid(Base):
         Density (kg/m³). Default is 1000.
     viscous : bool, optional
         Whether the liquid is viscous. Simply sets mu to zero when non-viscous. Default is False.
+    gamma : float, optional
+        Surface tension coefficient for the grid-based CSF extension. Default is 0.0, which disables surface tension.
     """
 
     viscous: StrictBool = False
+    gamma: NonNegativeFloat = 0.0
 
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
