@@ -25,7 +25,17 @@ class Liquid(Base):
     viscous : bool, optional
         Whether the liquid is viscous. Simply sets mu to zero when non-viscous. Default is False.
     gamma : float, optional
-        Surface-tension / cohesion strength used by the optional MPM surface-tension extension.
+        Backward-compatible SPH-like surface/cohesion strength. If the split controls below are left at 0.0, ``gamma``
+        is used for both particle cohesion and grid surface tension.
+    particle_cohesion_gamma : float, optional
+        SPH-like particle-particle cohesion strength. Use this to tune droplet clustering independently of grid surface
+        tension. Defaults to 0.0, which falls back to ``gamma``.
+    surface_tension_gamma : float, optional
+        Grid color-field surface-tension strength. Use this to tune free-surface restoration independently of particle
+        cohesion. Defaults to 0.0, which falls back to ``gamma``.
+    ground_horizontal_damping : float, optional
+        Near-ground horizontal damping used by the MPM surface-tension extension. Set to a value in [0, 1] manually in
+        practice. Defaults to 0.0, which makes the solver use its global fallback damping.
     sph_like : bool, optional
         Whether to interpret ``stiffness``, ``exponent``, ``mu`` and ``gamma`` using SPH-style numerical parameters.
         When enabled, ``lam`` is set from the linearized WCSPH bulk modulus ``stiffness * exponent`` and viscosity is
@@ -37,7 +47,14 @@ class Liquid(Base):
     """
 
     viscous: StrictBool = False
+
+    # Backward-compatible combined control. Existing scripts that pass gamma=... continue to work.
     gamma: NonNegativeFloat = 0.0
+
+    # Split controls for the enhanced MPM solver. A value of 0.0 means "inherit from gamma" for cohesion/surface terms.
+    particle_cohesion_gamma: NonNegativeFloat = 0.0
+    surface_tension_gamma: NonNegativeFloat = 0.0
+    ground_horizontal_damping: NonNegativeFloat = 0.0
 
     # SPH-style compatibility parameters. These let MPM.Liquid accept the same high-level controls as SPH.Liquid.
     sph_like: StrictBool = False
@@ -52,6 +69,12 @@ class Liquid(Base):
             # MPM liquid uses the volumetric stress coefficient lam for the same role.
             self.lam = self.stiffness * self.exponent
             self.viscous = True
+
+        # Backward compatibility: if the new split knobs are not specified, inherit the old gamma value.
+        if self.particle_cohesion_gamma == 0.0:
+            self.particle_cohesion_gamma = self.gamma
+        if self.surface_tension_gamma == 0.0:
+            self.surface_tension_gamma = self.gamma
 
         super().model_post_init(context)
 
