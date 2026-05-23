@@ -7,21 +7,24 @@ from .mpm_solver import MPMSolver as _BaseMPMSolver
 
 @qd.data_oriented
 class MPMSolver(_BaseMPMSolver):
-    """MPM solver extension with optional SPH-style cohesion/surface tension controls.
+    """MPM solver extension with optional SPH-style cohesion/surface-tension controls.
 
-    Surface tension/cohesion is enabled only when at least one MPM material has gamma > 0.
-    With gamma=0, this class follows the original MPMSolver path.
-
-    This extension adds three SPH-like stabilizers for ferrofluid-droplet style simulations:
+    Enhanced controls:
     1. particle-particle short-range cohesion before p2g,
-    2. more isotropic 26-neighbor color/curvature stencil on the MPM grid,
+    2. grid color-field surface tension with a 26-neighbor isotropic stencil,
     3. near-ground horizontal damping to reduce contact-line spreading.
+
+    Backward compatibility:
+    - Existing materials using ``gamma`` still work.
+    - New materials can independently set ``particle_cohesion_gamma`` and ``surface_tension_gamma``.
     """
 
     def __init__(self, scene, sim, options):
         super().__init__(scene, sim, options)
         self._has_surface_tension = False
-        self._material_gammas = []
+        self._material_particle_cohesion_gammas = []
+        self._material_surface_tension_gammas = []
+        self._material_ground_horizontal_dampings = []
 
         # Safety clamps for the added numerical forces.
         self._surface_tension_max_acc = 500.0
@@ -39,11 +42,20 @@ class MPMSolver(_BaseMPMSolver):
 
     def add_material(self, material):
         super().add_material(material)
-        gamma = float(getattr(material, "gamma", 0.0))
-        while len(self._material_gammas) <= material.idx:
-            self._material_gammas.append(0.0)
-        self._material_gammas[material.idx] = gamma
-        if gamma > 0.0:
+        particle_gamma = float(getattr(material, "particle_cohesion_gamma", getattr(material, "gamma", 0.0)))
+        surface_gamma = float(getattr(material, "surface_tension_gamma", getattr(material, "gamma", 0.0)))
+        ground_damping = float(getattr(material, "ground_horizontal_damping", 0.0))
+
+        while len(self._material_particle_cohesion_gammas) <= material.idx:
+            self._material_particle_cohesion_gammas.append(0.0)
+            self._material_surface_tension_gammas.append(0.0)
+            self._material_ground_horizontal_dampings.append(0.0)
+
+        self._material_particle_cohesion_gammas[material.idx] = particle_gamma
+        self._material_surface_tension_gammas[material.idx] = surface_gamma
+        self._material_ground_horizontal_dampings[material.idx] = ground_damping
+
+        if particle_gamma > 0.0 or surface_gamma > 0.0 or ground_damping > 0.0:
             self._has_surface_tension = True
 
     def build(self):
@@ -53,6 +65,8 @@ class MPMSolver(_BaseMPMSolver):
             self.surface_color = qd.field(dtype=gs.qd_float, shape=shape)
             self.surface_gamma_num = qd.field(dtype=gs.qd_float, shape=shape)
             self.surface_gamma_den = qd.field(dtype=gs.qd_float, shape=shape)
+            self.surface_ground_damping_num = qd.field(dtype=gs.qd_float, shape=shape)
+            self.surface_ground_damping_den = qd.field(dtype=gs.qd_float, shape=shape)
             self.surface_grad_c = qd.Vector.field(3, dtype=gs.qd_float, shape=shape)
             self.surface_normal = qd.Vector.field(3, dtype=gs.qd_float, shape=shape)
             self.surface_curvature = qd.field(dtype=gs.qd_float, shape=shape)
@@ -96,28 +110,47 @@ class MPMSolver(_BaseMPMSolver):
             self.surface_color[f, i, j, k, i_b] = gs.qd_float(0.0)
             self.surface_gamma_num[f, i, j, k, i_b] = gs.qd_float(0.0)
             self.surface_gamma_den[f, i, j, k, i_b] = gs.qd_float(0.0)
+            self.surface_ground_damping_num[f, i, j, k, i_b] = gs.qd_float(0.0)
+            self.surface_ground_damping_den[f, i, j, k, i_b] = gs.qd_float(0.0)
             self.surface_grad_c[f, i, j, k, i_b] = qd.Vector.zero(gs.qd_float, 3)
             self.surface_normal[f, i, j, k, i_b] = qd.Vector.zero(gs.qd_float, 3)
             self.surface_curvature[f, i, j, k, i_b] = gs.qd_float(0.0)
 
     @qd.func
-    def _func_particle_gamma(self, i_p):
+    def _func_particle_cohesion_gamma(self, i_p):
         gamma = gs.qd_float(0.0)
         for mat_idx in qd.static(self._materials_idx):
             if self.particles_info[i_p].material_idx == mat_idx:
-                gamma = gs.qd_float(self._material_gammas[mat_idx])
+                gamma = gs.qd_float(self._material_particle_cohesion_gammas[mat_idx])
         return gamma
+
+    @qd.func
+    def _func_surface_tension_gamma(self, i_p):
+        gamma = gs.qd_float(0.0)
+        for mat_idx in qd.static(self._materials_idx):
+            if self.particles_info[i_p].material_idx == mat_idx:
+                gamma = gs.qd_float(self._material_surface_tension_gammas[mat_idx])
+        return gamma
+
+    @qd.func
+    def _func_ground_horizontal_damping(self, i_p):
+        damping = gs.qd_float(0.0)
+        for mat_idx in qd.static(self._materials_idx):
+            if self.particles_info[i_p].material_idx == mat_idx:
+                damping = gs.qd_float(self._material_ground_horizontal_dampings[mat_idx])
+        return damping
 
     @qd.kernel
     def apply_particle_cohesion(self, f: qd.i32):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             if self.particles_ng[f, i_p, i_b].active:
-                gamma_i = self._func_particle_gamma(i_p)
+                gamma_i = self._func_particle_cohesion_gamma(i_p)
                 if gamma_i > gs.qd_float(0.0):
                     xi = self.particles[f, i_p, i_b].pos
                     acc = qd.Vector.zero(gs.qd_float, 3)
                     support_radius = gs.qd_float(self._particle_cohesion_radius_factor * self._particle_size)
 
+                    # O(N^2) fallback: acceptable for small droplets, but should later be replaced by spatial hashing.
                     for j_p in range(self._n_particles):
                         if j_p != i_p and self.particles_ng[f, j_p, i_b].active:
                             xj = self.particles[f, j_p, i_b].pos
@@ -142,9 +175,10 @@ class MPMSolver(_BaseMPMSolver):
     def project_surface_color(self, f: qd.i32):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             if self.particles_ng[f, i_p, i_b].active:
-                gamma = self._func_particle_gamma(i_p)
+                surface_gamma = self._func_surface_tension_gamma(i_p)
+                ground_damping = self._func_ground_horizontal_damping(i_p)
 
-                if gamma > gs.qd_float(0.0):
+                if surface_gamma > gs.qd_float(0.0) or ground_damping > gs.qd_float(0.0):
                     base = qd.floor(self.particles[f, i_p, i_b].pos * self._inv_dx - 0.5).cast(gs.qd_int)
                     fx = self.particles[f, i_p, i_b].pos * self._inv_dx - base.cast(gs.qd_float)
                     w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]
@@ -155,8 +189,10 @@ class MPMSolver(_BaseMPMSolver):
                             weight *= w[offset[d]][d]
                         color_contrib = weight * self._particle_volume_real * self._inv_dx * self._inv_dx * self._inv_dx
                         qd.atomic_add(self.surface_color[f, cell_ijk, i_b], color_contrib)
-                        qd.atomic_add(self.surface_gamma_num[f, cell_ijk, i_b], color_contrib * gamma)
+                        qd.atomic_add(self.surface_gamma_num[f, cell_ijk, i_b], color_contrib * surface_gamma)
                         qd.atomic_add(self.surface_gamma_den[f, cell_ijk, i_b], color_contrib)
+                        qd.atomic_add(self.surface_ground_damping_num[f, cell_ijk, i_b], color_contrib * ground_damping)
+                        qd.atomic_add(self.surface_ground_damping_den[f, cell_ijk, i_b], color_contrib)
 
     @qd.kernel
     def compute_surface_normal(self, f: qd.i32):
@@ -241,8 +277,8 @@ class MPMSolver(_BaseMPMSolver):
                     normal = grad_c / grad_norm
                     curvature = self.surface_curvature[f, I, i_b]
 
-                    # SPH-like numerical surface tension / cohesion. Here gamma is an acceleration-scale control,
-                    # not a physical N/m coefficient. This makes MPM.Liquid(gamma=...) behave closer to SPH.Liquid.
+                    # SPH-like numerical surface tension. Here gamma is an acceleration-scale control, not a physical
+                    # N/m coefficient. Use particle_cohesion_gamma separately for particle-particle clustering.
                     a_st = gamma * curvature * normal
 
                     a_norm = a_st.norm(gs.EPS)
@@ -261,5 +297,9 @@ class MPMSolver(_BaseMPMSolver):
                 ground_band = gs.qd_float(self._ground_damping_height_factor * self._particle_size)
                 if z > gs.qd_float(self._ground_z) and z < gs.qd_float(self._ground_z) + ground_band:
                     damping = gs.qd_float(self._ground_horizontal_damping)
+                    if self.surface_ground_damping_den[f, I, i_b] > gs.EPS:
+                        material_damping = self.surface_ground_damping_num[f, I, i_b] / self.surface_ground_damping_den[f, I, i_b]
+                        if material_damping > gs.qd_float(0.0):
+                            damping = material_damping
                     self.grid[f, I, i_b].vel_in[0] *= damping
                     self.grid[f, I, i_b].vel_in[1] *= damping
